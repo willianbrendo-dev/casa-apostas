@@ -1,0 +1,11 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+analise/videos/
+analise/debug/
+
+sucessos_okslots.txt
+proxies.txt
