@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 from playwright.async_api import async_playwright
 import os
+import random
 import shutil
 from datetime import datetime
 import sys # Biblioteca para detectar se é Windows ou Linux
@@ -38,7 +39,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
 PROXIES_FILE = os.path.join(BASE_DIR, "proxies.txt")
 SUCCESS_FILE = os.path.join(BASE_DIR, "sucessos_okslots.txt")
-VIDEO_RECORDING_ENABLED = True
+VIDEO_RECORDING_ENABLED = False
 VIDEO_OUTPUT_DIR = os.path.join(BASE_DIR, "analise", "videos")
 VIDEO_RECORDING_SIZE = {"width": 1280, "height": 720}
 
@@ -49,7 +50,7 @@ TEMPLATE_THRESHOLDS = {
     "tpl_btn_engrenagem.png": 0.56,
     "tpl_btn_sair.png": 0.62,
     "tpl_btn_confirmar.png": 0.56,
-    "tpl_btn_inscrever.png": 0.56,
+    "tpl_btn_inscrever.png": 0.85,
     "tpl_input_phone.png": 0.62,
     "tpl_input_pass.png": 0.62,
     "tpl_input_pass_confirm.png": 0.62,
@@ -134,9 +135,13 @@ ANSI_RESET = "\033[0m"
 
 
 def log(phone, message, level="INFO"):
+    normalized_level = level.upper()
+    # Verbosity gate: suppress INFO and SUCCESS to reduce terminal noise
+    if normalized_level in ("INFO", "SUCCESS"):
+        return
+
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     context_phone = phone if phone else "SYSTEM"
-    normalized_level = level.upper()
     color = ANSI_COLORS.get(normalized_level, ANSI_COLORS["INFO"])
     print(f"{color}[{timestamp}] [{context_phone}] [{normalized_level}] {message}{ANSI_RESET}")
 
@@ -300,6 +305,8 @@ async def match_template(page, template_name, threshold=None, timeout_ms=5000, p
     start_time = loop.time()
     best_score = -1.0
     best_scale = 1.0
+    best_loc = None
+    best_size = None
     iteration = 0
     warned_no_fit = False
 
@@ -345,6 +352,8 @@ async def match_template(page, template_name, threshold=None, timeout_ms=5000, p
             if current_score > best_score:
                 best_score = current_score
                 best_scale = current_scale
+                best_loc = current_loc
+                best_size = current_size
 
             log(
                 phone,
@@ -373,6 +382,24 @@ async def match_template(page, template_name, threshold=None, timeout_ms=5000, p
         log(phone, f"Timeout searching {template_name}. Best score was {best_score_msg} at scale {best_scale:.2f}.", "WARN")
     else:
         log(phone, f"Timeout searching {template_name}. Best score was {best_score_msg}.", "WARN")
+
+    # Debug visual: draw best-match bounding box on last screenshot if available
+    try:
+        if best_loc and best_size and 'img' in locals() and img is not None:
+            debug_dir = os.path.join(BASE_DIR, "analise", "debug")
+            os.makedirs(debug_dir, exist_ok=True)
+            img_color = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            tl_x, tl_y = int(best_loc[0]), int(best_loc[1])
+            w, h = int(best_size[0]), int(best_size[1])
+            br_x, br_y = tl_x + w, tl_y + h
+            cv2.rectangle(img_color, (tl_x, tl_y), (br_x, br_y), (0, 0, 255), thickness=4)
+            file_name = f"debug_mira_{_safe_file_token(template_name)}.png"
+            file_path = os.path.join(debug_dir, file_name)
+            cv2.imwrite(file_path, img_color)
+    except Exception:
+        # Never fail the detection flow due to debug image errors
+        pass
+
     return False
 
 
@@ -741,9 +768,9 @@ async def wait_for_registration_form_visual_ready(page, phone, timeout_ms=REGIST
     iteration = 0
 
     min_scores = {
-        "tpl_input_pass.png": 0.80,
-        "tpl_input_pass_confirm.png": 0.88,
-        "tpl_btn_inscrever_amarelo.png": 0.90,
+        "tpl_input_pass.png": 0.75,
+        "tpl_input_pass_confirm.png": 0.75,
+        "tpl_btn_inscrever_amarelo.png": 0.75,
     }
 
     required_templates = tuple(min_scores.keys())
@@ -831,6 +858,29 @@ async def wait_for_registration_form_visual_ready(page, phone, timeout_ms=REGIST
         ),
         "WARN",
     )
+    # Debug visual: mark observed template positions on last screenshot if available
+    try:
+        if 'img' in locals() and img is not None:
+            debug_dir = os.path.join(BASE_DIR, "analise", "debug")
+            os.makedirs(debug_dir, exist_ok=True)
+            img_color = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            # observed contains entries for pass, confirm, yellow templates
+            for key, data in observed.items():
+                try:
+                    if not data:
+                        continue
+                    x = int(data.get("x"))
+                    y = int(data.get("y"))
+                    # draw a small filled circle at the detected center
+                    color = (0, 255, 0) if "pass" in key else (255, 0, 0) if "confirm" in key else (0, 255, 255)
+                    cv2.circle(img_color, (x, y), radius=12, color=color, thickness=-1)
+                except Exception:
+                    continue
+            file_path = os.path.join(debug_dir, "debug_step5_layout.png")
+            cv2.imwrite(file_path, img_color)
+    except Exception:
+        pass
+
     return False
 
 
@@ -1299,6 +1349,12 @@ async def run_initial_gate_step(page, phone, timeout_ms=8000):
     return None
 
 
+def generate_random_phone():
+    valid_ddds = [ddd for ddd in range(11, 100) if str(ddd)[1] != '0']
+    ddd = random.choice(valid_ddds)
+    return f"{ddd}9{random.randint(10000000, 99999999)}"
+
+
 async def run_logout_step_after_gear(page, phone, require_confirm=False, require_register=False):
     log(phone, f"Step 2: waiting guest popup before logout click ({LOGOUT_POPUP_WAIT_MS}ms).", "INFO")
     await page.wait_for_timeout(LOGOUT_POPUP_WAIT_MS)
@@ -1364,22 +1420,11 @@ async def run_logout_step_after_gear(page, phone, require_confirm=False, require
     log(phone, f"Step 4: waiting post-logout refresh before register click ({REGISTER_ENTRY_POPUP_WAIT_MS}ms).", "INFO")
     await page.wait_for_timeout(REGISTER_ENTRY_POPUP_WAIT_MS)
 
-    register_selectors = [
-        'button:has-text("Inscrever")',
-        'button:has-text("Cadastrar")',
-        'a:has-text("Inscrever")',
-        'a:has-text("Cadastrar")',
-        "text=Inscrever",
-        "text=Cadastrar",
-    ]
-
-    clicked_register = await _click_with_fallback(
+    clicked_register = await match_template(
         page,
         "tpl_btn_inscrever.png",
-        register_selectors,
-        phone,
         timeout_ms=REGISTER_ENTRY_SEARCH_TIMEOUT_MS,
-        prefer_dom=False,
+        phone=phone,
     )
     if clicked_register:
         log(phone, "Step 4 validated: register entry button clicked.", "SUCCESS")
@@ -1424,8 +1469,8 @@ async def run_registration_form_steps(page, phone, require_submit=False):
         phone,
         timeout_ms=PHONE_INPUT_SEARCH_TIMEOUT_MS,
         field_kind="phone",
-        prefer_dom=True,
-        allow_template_fallback=False,
+        prefer_dom=False,
+        allow_template_fallback=True,
     )
     if not phone_input_ok:
         log(phone, "Step 5 warning: phone input was not found/filled via DOM. Trying keyboard fallback.", "WARN")
@@ -1462,8 +1507,8 @@ async def run_registration_form_steps(page, phone, require_submit=False):
             phone,
             timeout_ms=PASS_INPUT_SEARCH_TIMEOUT_MS,
             field_kind="password",
-            prefer_dom=True,
-            allow_template_fallback=False,
+            prefer_dom=False,
+            allow_template_fallback=True,
         )
         if not pass_input_ok:
             log(phone, "Step 6 warning: password input was not found/filled via DOM. Trying keyboard fallback.", "WARN")
@@ -1501,8 +1546,8 @@ async def run_registration_form_steps(page, phone, require_submit=False):
                 phone,
                 timeout_ms=PASS_CONFIRM_INPUT_SEARCH_TIMEOUT_MS,
                 field_kind="password_confirm",
-                prefer_dom=True,
-                allow_template_fallback=False,
+                prefer_dom=False,
+                allow_template_fallback=True,
             )
             if not pass_confirm_input_ok:
                 log(phone, "Step 7 warning: password confirmation input was not found/filled via DOM. Trying keyboard fallback.", "WARN")
@@ -1522,24 +1567,7 @@ async def run_registration_form_steps(page, phone, require_submit=False):
                 log(phone, "Step 7 validated: password confirmation input filled.", "SUCCESS")
                 log(phone, "Passo validado: confirmacao de senha preenchida.", "SUCCESS")
 
-    dom_values_ok = await validate_registration_values_dom(
-        page,
-        phone,
-        expected_phone=phone,
-        expected_password=REGISTER_PASSWORD,
-    )
-    if not dom_values_ok:
-        dom_inputs_available = await _has_accessible_registration_inputs(page)
-        if used_keyboard_fallback and not dom_inputs_available:
-            log(
-                phone,
-                "Step 7 warning: DOM does not expose accessible inputs for validation on this page/frame. Proceeding after keyboard fallback.",
-                "WARN",
-            )
-        else:
-            log(phone, "Step 7 failed: DOM validation did not confirm phone/password/password_confirmation.", "ERROR")
-            await _save_debug_screenshot(page, phone, "step7_dom_validation_failed")
-            return False
+    # Skip DOM validation and proceed directly to submit step
 
     if not require_submit:
         return True
@@ -1628,6 +1656,19 @@ async def worker(phone, semaphore, browser, proxy_list, template_status):
 
         current_proxy_slot = -1
 
+        # Prepare shuffled order so we can use all proxies exactly once in random order
+        shuffled_slots = []
+        used_slots = set()
+        if proxy_list:
+            shuffled_slots = list(range(len(proxy_list)))
+            random.shuffle(shuffled_slots)
+            # Log the shuffled order (by proxy label) to help debugging
+            try:
+                shuffled_labels = [proxy_list[i]["label"] for i in shuffled_slots]
+                log(phone, f"Shuffled proxy order: {', '.join(shuffled_labels)}", "INFO")
+            except Exception:
+                pass
+
         def _current_route_label():
             if current_proxy_slot < 0 or not proxy_list:
                 return "Clean IP"
@@ -1640,10 +1681,51 @@ async def worker(phone, semaphore, browser, proxy_list, template_status):
                 return
 
             previous_label = _current_route_label()
-            if current_proxy_slot < 0:
-                current_proxy_slot = 0
-            else:
-                current_proxy_slot = (current_proxy_slot + 1) % len(proxy_list)
+
+            try:
+                # ensure shuffled_slots is initialized
+                if not shuffled_slots:
+                    shuffled_slots.extend(range(len(proxy_list)))
+                    random.shuffle(shuffled_slots)
+                    used_slots.clear()
+
+                # If reason mentions 1010, pick the first proxy from shuffled order that is different
+                # from the proxy that just failed (current_proxy_slot). This ensures we don't retry
+                # the same proxy after a 1010 detection.
+                if "1010" in reason:
+                    chosen = None
+                    for slot in shuffled_slots:
+                        if slot != current_proxy_slot:
+                            chosen = slot
+                            break
+                    if chosen is None:
+                        # all slots equal to current (unlikely) -> pick first
+                        chosen = shuffled_slots[0]
+                    current_proxy_slot = chosen
+                    used_slots.add(chosen)
+                else:
+                    # pick next unused slot from shuffled_slots
+                    chosen = None
+                    for slot in shuffled_slots:
+                        if slot not in used_slots:
+                            chosen = slot
+                            break
+
+                    if chosen is None:
+                        # all used -> reset and reshuffle
+                        used_slots.clear()
+                        random.shuffle(shuffled_slots)
+                        chosen = shuffled_slots[0]
+
+                    current_proxy_slot = chosen
+                    used_slots.add(chosen)
+            except Exception:
+                # fallback sequential behavior
+                if current_proxy_slot < 0:
+                    current_proxy_slot = 0
+                else:
+                    current_proxy_slot = (current_proxy_slot + 1) % len(proxy_list)
+
             next_label = _current_route_label()
             log(phone, f"{reason} Rotating route: {previous_label} -> {next_label}.", "WARN")
 
@@ -1672,9 +1754,7 @@ async def worker(phone, semaphore, browser, proxy_list, template_status):
                     "device_scale_factor": 1,
                     "color_scheme": "light",
                 }
-                if VIDEO_RECORDING_ENABLED:
-                    context_options["record_video_dir"] = VIDEO_OUTPUT_DIR
-                    context_options["record_video_size"] = VIDEO_RECORDING_SIZE
+                
 
                 context = await browser.new_context(**context_options)
                 log(phone, "Opening new page...", "INFO")
@@ -1735,9 +1815,34 @@ async def worker(phone, semaphore, browser, proxy_list, template_status):
                     ):
                         if require_inputs:
                             if await run_registration_form_steps(page, phone, require_submit=require_submit):
-                                attempt_video_status = "success"
-                                log(phone, f"FLOW_MODE={FLOW_MODE}: steps validated, finishing worker.", "SUCCESS")
-                                return True
+                                log(phone, 'Aguardando tela final de sucesso...', 'INFO')
+                                # Verify final success template visually WITHOUT performing any click
+                                sucesso_final = False
+                                try:
+                                    screenshot_bytes = await page.screenshot()
+                                    nparr = np.frombuffer(screenshot_bytes, np.uint8)
+                                    img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+                                    template_name = 'tpl_sucesso_final.png'
+                                    variants = _get_template_variants(template_name, phone=phone)
+                                    effective_threshold = TEMPLATE_THRESHOLDS.get(template_name, DEFAULT_TEMPLATE_THRESHOLD)
+                                    if img is not None and variants:
+                                        match_data = _match_template_on_image(img, variants)
+                                        if match_data and match_data.get('score', 0) >= effective_threshold:
+                                            sucesso_final = True
+                                except Exception as _:
+                                    sucesso_final = False
+
+                                if sucesso_final:
+                                    attempt_video_status = 'success'
+                                    with open(SUCCESS_FILE, "a", encoding="utf-8") as f:
+                                        f.write(f"{phone}\n")
+                                    log(phone, f"Phone persisted into {SUCCESS_FILE}", "SUCCESS")
+                                    log(phone, 'Sucesso confirmado! Pausando 15s para validação visual do usuário...', 'INFO')
+                                    await page.wait_for_timeout(15000)
+                                    return True
+                                else:
+                                    log(phone, "Final proof failed: final success template not found.", "ERROR")
+                                    continue
                             attempt_video_status = "retry_form_sequence_failed"
                             log(phone, f"FLOW_MODE={FLOW_MODE}: form sequence failed. Retrying same route.", "ERROR")
                             continue
@@ -1774,22 +1879,8 @@ async def worker(phone, semaphore, browser, proxy_list, template_status):
 
                 # 3. Porta da Frente (Cadastro)
                 log(phone, "Checking registration entry button...", "INFO")
-                register_entry_selectors = [
-                    'button:has-text("Inscrever")',
-                    'button:has-text("Cadastrar")',
-                    'a:has-text("Inscrever")',
-                    'a:has-text("Cadastrar")',
-                    "text=Inscrever",
-                    "text=Cadastrar",
-                ]
-                if not await _click_with_fallback(
-                    page,
-                    "tpl_btn_inscrever.png",
-                    register_entry_selectors,
-                    phone,
-                    timeout_ms=7000,
-                    prefer_dom=True,
-                ):
+                # register_entry_selectors removed - force vision-only match
+                if not await match_template(page, "tpl_btn_inscrever.png", timeout_ms=7000, phone=phone):
                     log(phone, "Critical error: Register button not found. Rotating attempt.", "ERROR")
                     continue
 
@@ -1931,12 +2022,7 @@ async def worker(phone, semaphore, browser, proxy_list, template_status):
                     except Exception as e:
                         log(phone, f"Context close warning on attempt {attempt + 1}: {e}", "WARN")
 
-                await _finalize_attempt_video(
-                    page,
-                    phone,
-                    attempt_number=attempt + 1,
-                    status_label=attempt_video_status,
-                )
+                
 
         log(phone, "FAILURE: Maximum retries exhausted.", "ERROR")
 
@@ -1962,7 +2048,7 @@ async def main():
     proxy_list = get_proxies()
     log("SYSTEM", f"Loaded proxies: {len(proxy_list)}", "INFO")
 
-    phones_to_register = ["11985632643", "11993745580", "11961812492", "11911112222", "11933334444"]
+    phones_to_register = [generate_random_phone() for _ in range(5)]
     log("SYSTEM", f"Phones queued for processing: {len(phones_to_register)}", "INFO")
 
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_BROWSERS)
