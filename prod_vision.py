@@ -55,6 +55,7 @@ TEMPLATE_THRESHOLDS = {
     "tpl_input_pass.png": 0.62,
     "tpl_input_pass_confirm.png": 0.62,
     "tpl_btn_inscrever_amarelo.png": 0.56,
+    "tpl_btn_deposito.png": 0.56,
 }
 REQUIRED_TEMPLATES_FULL = (
     "tpl_btn_ok_1010.png",
@@ -1598,6 +1599,84 @@ async def run_registration_form_steps(page, phone, require_submit=False):
     return True
 
 
+async def detect_success_deposit_button(page, phone, timeout_ms=5000):
+    template_name = "tpl_btn_deposito.png"
+    template_variants = _get_template_variants(template_name, phone=phone)
+    if not template_variants:
+        log(phone, f"Success proof template unavailable: {template_name}", "ERROR")
+        return False
+
+    timeout_seconds = timeout_ms / 1000
+    loop = asyncio.get_running_loop()
+    start_time = loop.time()
+
+    while (loop.time() - start_time) < timeout_seconds:
+        try:
+            screenshot_bytes = await page.screenshot()
+            nparr = np.frombuffer(screenshot_bytes, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                await asyncio.sleep(0.4)
+                continue
+
+            match_data = _match_template_on_image(img, template_variants)
+            if match_data and match_data["score"] >= TEMPLATE_THRESHOLDS.get(template_name, DEFAULT_TEMPLATE_THRESHOLD):
+                log(phone, "Success proof validated: deposit button detected.", "SUCCESS")
+                return True
+        except Exception as e:
+            log(phone, f"Success proof detection warning: {e}", "WARN")
+
+        await asyncio.sleep(0.4)
+
+    return False
+
+
+async def wait_and_capture_post_registration(page, phone):
+    log(phone, "Aguardando carregamento completo apos cadastro...", "INFO")
+    await page.wait_for_load_state("networkidle")
+    log(phone, "Carregamento pos-cadastro: networkidle recebido.", "SUCCESS")
+
+    await page.wait_for_timeout(8000)
+
+    os.makedirs("debug", exist_ok=True)
+
+    screenshot_path = os.path.join("debug", "tela_pos_cadastro.png")
+    await page.screenshot(path=screenshot_path, full_page=True)
+    log(phone, f"Screenshot pos-cadastro salvo em {screenshot_path}", "SUCCESS")
+    sys.exit(0)
+
+
+async def run_post_success_logout_cycle(page, phone):
+    if not await match_template(page, "tpl_btn_engrenagem.png", timeout_ms=LOGOUT_SEARCH_TIMEOUT_MS, phone=phone):
+        await _save_debug_screenshot(page, phone, "post_success_gear_not_found")
+        log(phone, "Post-success logout failed: gear button was not found/clicked.", "ERROR")
+        return False
+
+    await page.wait_for_timeout(LOGOUT_POPUP_WAIT_MS)
+
+    if not await match_template(page, "tpl_btn_sair.png", timeout_ms=LOGOUT_SEARCH_TIMEOUT_MS, phone=phone):
+        await _save_debug_screenshot(page, phone, "post_success_logout_not_found")
+        log(phone, "Post-success logout failed: logout button was not found/clicked.", "ERROR")
+        return False
+
+    await page.wait_for_timeout(LOGOUT_CONFIRM_POPUP_WAIT_MS)
+
+    if not await match_template(page, "tpl_btn_confirmar.png", timeout_ms=LOGOUT_CONFIRM_SEARCH_TIMEOUT_MS, phone=phone):
+        await _save_debug_screenshot(page, phone, "post_success_confirm_not_found")
+        log(phone, "Post-success logout failed: confirm button was not found/clicked.", "ERROR")
+        return False
+
+    await page.wait_for_timeout(REGISTER_ENTRY_POPUP_WAIT_MS)
+
+    if not await match_template(page, "tpl_btn_inscrever.png", timeout_ms=REGISTER_ENTRY_SEARCH_TIMEOUT_MS, phone=phone):
+        await _save_debug_screenshot(page, phone, "post_success_register_not_found")
+        log(phone, "Post-success logout failed: register entry button was not found/clicked.", "ERROR")
+        return False
+
+    log(phone, "Post-success logout cycle validated: register entry reopened.", "SUCCESS")
+    return True
+
+
 async def wait_for_page_readiness(page, phone):
     log(phone, "Waiting for page readiness signals before gate scan...", "INFO")
 
@@ -1654,90 +1733,86 @@ async def worker(phone, semaphore, browser, proxy_list, template_status):
         if not run_1010_checks:
             log(phone, "tpl_btn_ok_1010.png unavailable. 1010 checks disabled for this worker.", "WARN")
 
+        active_proxy_list = list(proxy_list)
         current_proxy_slot = -1
 
-        # Prepare shuffled order so we can use all proxies exactly once in random order
-        shuffled_slots = []
-        used_slots = set()
-        if proxy_list:
-            shuffled_slots = list(range(len(proxy_list)))
-            random.shuffle(shuffled_slots)
-            # Log the shuffled order (by proxy label) to help debugging
+        def _refresh_proxy_pool_from_active_list():
+            nonlocal current_proxy_slot
+            if not active_proxy_list:
+                current_proxy_slot = -1
+                return
+
+            if current_proxy_slot >= len(active_proxy_list):
+                current_proxy_slot = -1
+
+        def _reload_proxy_list_if_needed(reason):
+            nonlocal active_proxy_list, current_proxy_slot
+            if active_proxy_list:
+                return True
+
+            reloaded_proxies = get_proxies()
+            if reloaded_proxies:
+                active_proxy_list = list(reloaded_proxies)
+                current_proxy_slot = -1
+                log(phone, f"{reason} Proxy list exhausted. Reloaded {len(active_proxy_list)} proxies from file.", "WARN")
+                return True
+
+            log(phone, f"{reason} Fim da lista de proxies.", "ERROR")
+            return False
+
+        if active_proxy_list:
             try:
-                shuffled_labels = [proxy_list[i]["label"] for i in shuffled_slots]
+                shuffled_labels = [proxy["label"] for proxy in random.sample(active_proxy_list, len(active_proxy_list))]
                 log(phone, f"Shuffled proxy order: {', '.join(shuffled_labels)}", "INFO")
             except Exception:
                 pass
 
         def _current_route_label():
-            if current_proxy_slot < 0 or not proxy_list:
+            if current_proxy_slot < 0 or not active_proxy_list:
                 return "Clean IP"
-            return proxy_list[current_proxy_slot]["label"]
+            return active_proxy_list[current_proxy_slot]["label"]
 
         def _rotate_to_next_proxy(reason):
-            nonlocal current_proxy_slot
-            if not proxy_list:
-                log(phone, f"{reason} Proxy list is empty. Keeping Clean IP.", "WARN")
-                return
+            nonlocal active_proxy_list, current_proxy_slot
+
+            failed_label = _current_route_label()
+            failed_proxy = None
+            if current_proxy_slot >= 0 and current_proxy_slot < len(active_proxy_list):
+                failed_proxy = active_proxy_list[current_proxy_slot]
+
+            if failed_proxy is not None and "1010" in reason:
+                active_proxy_list = [proxy for proxy in active_proxy_list if proxy is not failed_proxy]
+                current_proxy_slot = -1
+                log(phone, f"{reason} Proxy banido da lista ativa: {failed_label}.", "WARN")
+
+            _refresh_proxy_pool_from_active_list()
+            if not _reload_proxy_list_if_needed(reason):
+                return False
 
             previous_label = _current_route_label()
 
             try:
-                # ensure shuffled_slots is initialized
-                if not shuffled_slots:
-                    shuffled_slots.extend(range(len(proxy_list)))
-                    random.shuffle(shuffled_slots)
-                    used_slots.clear()
-
-                # If reason mentions 1010, pick the first proxy from shuffled order that is different
-                # from the proxy that just failed (current_proxy_slot). This ensures we don't retry
-                # the same proxy after a 1010 detection.
-                if "1010" in reason:
-                    chosen = None
-                    for slot in shuffled_slots:
-                        if slot != current_proxy_slot:
-                            chosen = slot
-                            break
-                    if chosen is None:
-                        # all slots equal to current (unlikely) -> pick first
-                        chosen = shuffled_slots[0]
-                    current_proxy_slot = chosen
-                    used_slots.add(chosen)
-                else:
-                    # pick next unused slot from shuffled_slots
-                    chosen = None
-                    for slot in shuffled_slots:
-                        if slot not in used_slots:
-                            chosen = slot
-                            break
-
-                    if chosen is None:
-                        # all used -> reset and reshuffle
-                        used_slots.clear()
-                        random.shuffle(shuffled_slots)
-                        chosen = shuffled_slots[0]
-
-                    current_proxy_slot = chosen
-                    used_slots.add(chosen)
+                chosen = random.randrange(len(active_proxy_list))
+                current_proxy_slot = chosen
             except Exception:
-                # fallback sequential behavior
-                if current_proxy_slot < 0:
-                    current_proxy_slot = 0
-                else:
-                    current_proxy_slot = (current_proxy_slot + 1) % len(proxy_list)
+                current_proxy_slot = 0 if active_proxy_list else -1
 
             next_label = _current_route_label()
             log(phone, f"{reason} Rotating route: {previous_label} -> {next_label}.", "WARN")
+            return True
 
         for attempt in range(total_attempts):
+            if not _reload_proxy_list_if_needed("Attempt startup."):
+                break
+
             current_proxy = None
-            if current_proxy_slot >= 0 and proxy_list:
-                current_proxy = proxy_list[current_proxy_slot]["config"]
+            if current_proxy_slot >= 0 and active_proxy_list:
+                current_proxy = active_proxy_list[current_proxy_slot]["config"]
 
             if current_proxy is not None:
                 log(
                     phone,
-                    f"Attempt {attempt + 1}/{total_attempts}: using Proxy {_current_route_label()} (slot {current_proxy_slot + 1}/{len(proxy_list)}).",
+                    f"Attempt {attempt + 1}/{total_attempts}: using Proxy {_current_route_label()} (slot {current_proxy_slot + 1}/{len(active_proxy_list)}).",
                     "INFO",
                 )
             else:
@@ -1766,250 +1841,239 @@ async def worker(phone, semaphore, browser, proxy_list, template_status):
                 await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
                 await wait_for_page_readiness(page, phone)
 
-                initial_gate = await run_initial_gate_step(page, phone, timeout_ms=INITIAL_GATE_TIMEOUT_MS)
-                if not initial_gate:
-                    attempt_video_status = "retry_gate_not_matched"
-                    log(
-                        phone,
-                        "Step 1 failed: neither tpl_btn_ok_1010 nor tpl_btn_engrenagem passed threshold. Retrying same route.",
-                        "ERROR",
-                    )
-                    continue
+                while True:
+                    initial_gate = await run_initial_gate_step(page, phone, timeout_ms=INITIAL_GATE_TIMEOUT_MS)
+                    if not initial_gate:
+                        attempt_video_status = "retry_gate_not_matched"
+                        log(
+                            phone,
+                            "Step 1 failed: neither tpl_btn_ok_1010 nor tpl_btn_engrenagem passed threshold. Breaking current session.",
+                            "ERROR",
+                        )
+                        break
 
-                selected_template = initial_gate["template_name"]
+                    selected_template = initial_gate["template_name"]
 
-                if selected_template == "tpl_btn_ok_1010.png":
-                    attempt_video_status = "rotate_1010_initial"
-                    _rotate_to_next_proxy("Initial gate detected 1010.")
-                    continue
+                    if selected_template == "tpl_btn_ok_1010.png":
+                        attempt_video_status = "rotate_1010_initial"
+                        if not _rotate_to_next_proxy("Initial gate detected 1010."):
+                            break
+                        break
 
-                if FLOW_MODE in (
-                    "gear_logout_only",
-                    "gear_logout_confirm_only",
-                    "gear_logout_confirm_register_only",
-                    "gear_logout_confirm_register_inputs_only",
-                    "gear_logout_confirm_register_form_only",
-                ):
-                    require_confirm = FLOW_MODE in (
+                    if FLOW_MODE in (
+                        "gear_logout_only",
                         "gear_logout_confirm_only",
                         "gear_logout_confirm_register_only",
                         "gear_logout_confirm_register_inputs_only",
                         "gear_logout_confirm_register_form_only",
-                    )
-                    require_register = FLOW_MODE in (
-                        "gear_logout_confirm_register_only",
-                        "gear_logout_confirm_register_inputs_only",
-                        "gear_logout_confirm_register_form_only",
-                    )
-                    require_inputs = FLOW_MODE in (
-                        "gear_logout_confirm_register_inputs_only",
-                        "gear_logout_confirm_register_form_only",
-                    )
-                    require_submit = FLOW_MODE == "gear_logout_confirm_register_form_only"
+                    ):
+                        require_confirm = FLOW_MODE in (
+                            "gear_logout_confirm_only",
+                            "gear_logout_confirm_register_only",
+                            "gear_logout_confirm_register_inputs_only",
+                            "gear_logout_confirm_register_form_only",
+                        )
+                        require_register = FLOW_MODE in (
+                            "gear_logout_confirm_register_only",
+                            "gear_logout_confirm_register_inputs_only",
+                            "gear_logout_confirm_register_form_only",
+                        )
+                        require_inputs = FLOW_MODE in (
+                            "gear_logout_confirm_register_inputs_only",
+                            "gear_logout_confirm_register_form_only",
+                        )
+                        require_submit = FLOW_MODE == "gear_logout_confirm_register_form_only"
 
-                    if await run_logout_step_after_gear(
+                        if await run_logout_step_after_gear(
+                            page,
+                            phone,
+                            require_confirm=require_confirm,
+                            require_register=require_register,
+                        ):
+                            if require_inputs:
+                                if await run_registration_form_steps(page, phone, require_submit=require_submit):
+                                    await wait_and_capture_post_registration(page, phone)
+
+                                attempt_video_status = "retry_form_sequence_failed"
+                                log(phone, f"FLOW_MODE={FLOW_MODE}: form sequence failed. Breaking current session.", "ERROR")
+                                break
+
+                            attempt_video_status = "success"
+                            log(phone, f"FLOW_MODE={FLOW_MODE}: steps validated, finishing worker.", "SUCCESS")
+                            return True
+
+                        attempt_video_status = "retry_validation_sequence_failed"
+                        log(phone, f"FLOW_MODE={FLOW_MODE}: validation sequence failed. Breaking current session.", "ERROR")
+                        break
+
+                    if FLOW_MODE in ("initial_gate_only", "gear_only"):
+                        attempt_video_status = "success"
+                        log(
+                            phone,
+                            f"FLOW_MODE={FLOW_MODE}: step validated by {selected_template}, finishing worker.",
+                            "SUCCESS",
+                        )
+                        return True
+
+                    # 2. Bypass da Sessão Logada (Logout via Engrenagem)
+                    guest_menu_already_open = selected_template == "tpl_btn_engrenagem.png"
+                    log(phone, "Checking Guest Login...", "INFO")
+                    if guest_menu_already_open or await match_template(page, "tpl_btn_engrenagem.png", timeout_ms=3000, phone=phone):
+                        log(phone, "Guest session detected. Forcing logout sequence.", "WARN")
+                        await asyncio.sleep(1)
+                        log(phone, "Clicking logout option...", "INFO")
+                        if not await match_template(page, "tpl_btn_sair.png", timeout_ms=3000, phone=phone):
+                            await _save_debug_screenshot(page, phone, "legacy_logout_not_found")
+                            attempt_video_status = "retry_logout_not_found"
+                            break
+                        await asyncio.sleep(1)
+                        log(phone, "Clicking logout confirmation...", "INFO")
+                        if not await match_template(page, "tpl_btn_confirmar.png", timeout_ms=3000, phone=phone):
+                            await _save_debug_screenshot(page, phone, "legacy_confirm_not_found")
+                            attempt_video_status = "retry_logout_confirm_not_found"
+                            break
+                        log(phone, "Waiting page refresh after logout (4000ms).", "INFO")
+                        await page.wait_for_timeout(4000)
+
+                    # 3. Porta da Frente (Cadastro)
+                    log(phone, "Checking registration entry button...", "INFO")
+                    if not await match_template(page, "tpl_btn_inscrever.png", timeout_ms=7000, phone=phone):
+                        await _save_debug_screenshot(page, phone, "legacy_register_not_found")
+                        log(phone, "Critical error: Register button not found. Breaking current session.", "ERROR")
+                        attempt_video_status = "retry_register_not_found"
+                        break
+
+                    # Preenchimento com fallback visual + DOM
+                    log(phone, "Filling phone input...", "INFO")
+                    phone_input_selectors = [
+                        "input[type='tel']",
+                        "input[name*='phone' i]",
+                        "input[id*='phone' i]",
+                        "input[placeholder*='phone' i]",
+                        "input[name*='telefone' i]",
+                        "input[id*='telefone' i]",
+                        "input[placeholder*='telefone' i]",
+                        "input[inputmode='numeric']",
+                        "input[type='text']",
+                    ]
+                    phone_input_ok = await _fill_with_fallback(
+                        page,
+                        "tpl_input_phone.png",
+                        phone_input_selectors,
+                        phone,
+                        phone,
+                        timeout_ms=3000,
+                        field_kind="phone",
+                        prefer_dom=True,
+                    )
+                    if not phone_input_ok:
+                        await _save_debug_screenshot(page, phone, "legacy_phone_fill_failed")
+                        log(phone, "Phone input was not found by template or DOM fallback. Breaking current session.", "ERROR")
+                        attempt_video_status = "retry_phone_fill_failed"
+                        break
+
+                    log(phone, "Filling password input...", "INFO")
+                    pass_input_selectors = [
+                        "input[name*='pass' i]:not([name*='confirm' i]):not([name*='confirma' i])",
+                        "input[id*='pass' i]:not([id*='confirm' i]):not([id*='confirma' i])",
+                        "input[placeholder*='pass' i]:not([placeholder*='confirm' i]):not([placeholder*='confirma' i])",
+                        "input[name*='senha' i]:not([name*='confirm' i]):not([name*='confirma' i])",
+                        "input[id*='senha' i]:not([id*='confirm' i]):not([id*='confirma' i])",
+                        "input[placeholder*='senha' i]:not([placeholder*='confirm' i]):not([placeholder*='confirma' i])",
+                        "input[type='password']",
+                    ]
+                    pass_input_ok = await _fill_with_fallback(
+                        page,
+                        "tpl_input_pass.png",
+                        pass_input_selectors,
+                        REGISTER_PASSWORD,
+                        phone,
+                        timeout_ms=3000,
+                        field_kind="password",
+                        prefer_dom=True,
+                    )
+                    if not pass_input_ok:
+                        await _save_debug_screenshot(page, phone, "legacy_pass_fill_failed")
+                        log(phone, "Password input was not found by template or DOM fallback. Breaking current session.", "ERROR")
+                        attempt_video_status = "retry_pass_fill_failed"
+                        break
+
+                    log(phone, "Filling password confirmation input...", "INFO")
+                    pass_confirm_input_selectors = [
+                        "input[name*='confirm' i]",
+                        "input[id*='confirm' i]",
+                        "input[placeholder*='confirm' i]",
+                        "input[name*='confirma' i]",
+                        "input[id*='confirma' i]",
+                        "input[placeholder*='confirma' i]",
+                        "input[name*='repeat' i]",
+                        "input[id*='repeat' i]",
+                        "input[placeholder*='repeat' i]",
+                    ]
+                    pass_confirm_input_ok = await _fill_with_fallback(
+                        page,
+                        "tpl_input_pass_confirm.png",
+                        pass_confirm_input_selectors,
+                        REGISTER_PASSWORD,
+                        phone,
+                        timeout_ms=3000,
+                        field_kind="password_confirm",
+                        prefer_dom=True,
+                    )
+                    if not pass_confirm_input_ok:
+                        await _save_debug_screenshot(page, phone, "legacy_pass_confirm_fill_failed")
+                        log(phone, "Password confirmation input was not found by template or DOM fallback. Breaking current session.", "ERROR")
+                        attempt_video_status = "retry_pass_confirm_fill_failed"
+                        break
+
+                    dom_values_ok = await validate_registration_values_dom(
                         page,
                         phone,
-                        require_confirm=require_confirm,
-                        require_register=require_register,
-                    ):
-                        if require_inputs:
-                            if await run_registration_form_steps(page, phone, require_submit=require_submit):
-                                log(phone, 'Aguardando tela final de sucesso...', 'INFO')
-                                # Verify final success template visually WITHOUT performing any click
-                                sucesso_final = False
-                                try:
-                                    screenshot_bytes = await page.screenshot()
-                                    nparr = np.frombuffer(screenshot_bytes, np.uint8)
-                                    img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
-                                    template_name = 'tpl_sucesso_final.png'
-                                    variants = _get_template_variants(template_name, phone=phone)
-                                    effective_threshold = TEMPLATE_THRESHOLDS.get(template_name, DEFAULT_TEMPLATE_THRESHOLD)
-                                    if img is not None and variants:
-                                        match_data = _match_template_on_image(img, variants)
-                                        if match_data and match_data.get('score', 0) >= effective_threshold:
-                                            sucesso_final = True
-                                except Exception as _:
-                                    sucesso_final = False
-
-                                if sucesso_final:
-                                    attempt_video_status = 'success'
-                                    with open(SUCCESS_FILE, "a", encoding="utf-8") as f:
-                                        f.write(f"{phone}\n")
-                                    log(phone, f"Phone persisted into {SUCCESS_FILE}", "SUCCESS")
-                                    log(phone, 'Sucesso confirmado! Pausando 15s para validação visual do usuário...', 'INFO')
-                                    await page.wait_for_timeout(15000)
-                                    return True
-                                else:
-                                    log(phone, "Final proof failed: final success template not found.", "ERROR")
-                                    continue
-                            attempt_video_status = "retry_form_sequence_failed"
-                            log(phone, f"FLOW_MODE={FLOW_MODE}: form sequence failed. Retrying same route.", "ERROR")
-                            continue
-
-                        attempt_video_status = "success"
-                        log(phone, f"FLOW_MODE={FLOW_MODE}: steps validated, finishing worker.", "SUCCESS")
-                        return True
-                    attempt_video_status = "retry_validation_sequence_failed"
-                    log(phone, f"FLOW_MODE={FLOW_MODE}: validation sequence failed. Retrying same route.", "ERROR")
-                    continue
-
-                if FLOW_MODE in ("initial_gate_only", "gear_only"):
-                    attempt_video_status = "success"
-                    log(
-                        phone,
-                        f"FLOW_MODE={FLOW_MODE}: step validated by {selected_template}, finishing worker.",
-                        "SUCCESS",
+                        expected_phone=phone,
+                        expected_password=REGISTER_PASSWORD,
                     )
+                    if not dom_values_ok:
+                        await _save_debug_screenshot(page, phone, "legacy_dom_validation_failed")
+                        log(phone, "DOM validation failed for phone/password/password_confirmation. Breaking current session.", "ERROR")
+                        attempt_video_status = "retry_dom_validation_failed"
+                        break
+
+                    log(phone, "Clicking final yellow register button...", "INFO")
+                    submit_selectors = [
+                        "button[type='submit']",
+                        "form button:has-text('Inscrever')",
+                        "form button:has-text('Cadastrar')",
+                        'button:has-text("Cadastrar")',
+                        'button:has-text("Inscrever")',
+                        'button:has-text("Registrar")',
+                        "text=Confirmar",
+                    ]
+                    submit_found = await _click_with_fallback(
+                        page,
+                        "tpl_btn_inscrever_amarelo.png",
+                        submit_selectors,
+                        phone,
+                        timeout_ms=3000,
+                        prefer_dom=True,
+                    )
+                    if not submit_found:
+                        await _save_debug_screenshot(page, phone, "legacy_submit_not_found")
+                        log(phone, "Final yellow register action not found by template or DOM fallback. Breaking current session.", "ERROR")
+                        attempt_video_status = "retry_submit_not_found"
+                        break
+
+                    log(phone, "Passo validado: botao Inscrever amarelo clicado.", "SUCCESS")
+
+                    await wait_and_capture_post_registration(page, phone)
+
+                    
+                if attempt_video_status == "success":
                     return True
 
-                # 2. Bypass da Sessão Logada (Logout via Engrenagem)
-                guest_menu_already_open = selected_template == "tpl_btn_engrenagem.png"
-                log(phone, "Checking Guest Login...", "INFO")
-                if guest_menu_already_open or await match_template(page, "tpl_btn_engrenagem.png", timeout_ms=3000, phone=phone):
-                    log(phone, "Guest session detected. Forcing logout sequence.", "WARN")
-                    await asyncio.sleep(1)
-                    log(phone, "Clicking logout option...", "INFO")
-                    await match_template(page, "tpl_btn_sair.png", timeout_ms=3000, phone=phone)
-                    await asyncio.sleep(1) # Espera a animação do modal
-                    log(phone, "Clicking logout confirmation...", "INFO")
-                    await match_template(page, "tpl_btn_confirmar.png", timeout_ms=3000, phone=phone)
-                    log(phone, "Waiting page refresh after logout (4000ms).", "INFO")
-                    await page.wait_for_timeout(4000) # Espera refresh da pagina
-
-                # 3. Porta da Frente (Cadastro)
-                log(phone, "Checking registration entry button...", "INFO")
-                # register_entry_selectors removed - force vision-only match
-                if not await match_template(page, "tpl_btn_inscrever.png", timeout_ms=7000, phone=phone):
-                    log(phone, "Critical error: Register button not found. Rotating attempt.", "ERROR")
+                if attempt_video_status.startswith("rotate_1010"):
                     continue
 
-                # Preenchimento com fallback visual + DOM
-                log(phone, "Filling phone input...", "INFO")
-                phone_input_selectors = [
-                    "input[type='tel']",
-                    "input[name*='phone' i]",
-                    "input[id*='phone' i]",
-                    "input[placeholder*='phone' i]",
-                    "input[name*='telefone' i]",
-                    "input[id*='telefone' i]",
-                    "input[placeholder*='telefone' i]",
-                    "input[inputmode='numeric']",
-                    "input[type='text']",
-                ]
-                phone_input_ok = await _fill_with_fallback(
-                    page,
-                    "tpl_input_phone.png",
-                    phone_input_selectors,
-                    phone,
-                    phone,
-                    timeout_ms=3000,
-                    field_kind="phone",
-                    prefer_dom=True,
-                )
-                if not phone_input_ok:
-                    log(phone, "Phone input was not found by template or DOM fallback. Rotating attempt.", "ERROR")
-                    continue
-
-                log(phone, "Filling password input...", "INFO")
-                pass_input_selectors = [
-                    "input[name*='pass' i]:not([name*='confirm' i]):not([name*='confirma' i])",
-                    "input[id*='pass' i]:not([id*='confirm' i]):not([id*='confirma' i])",
-                    "input[placeholder*='pass' i]:not([placeholder*='confirm' i]):not([placeholder*='confirma' i])",
-                    "input[name*='senha' i]:not([name*='confirm' i]):not([name*='confirma' i])",
-                    "input[id*='senha' i]:not([id*='confirm' i]):not([id*='confirma' i])",
-                    "input[placeholder*='senha' i]:not([placeholder*='confirm' i]):not([placeholder*='confirma' i])",
-                    "input[type='password']",
-                ]
-                pass_input_ok = await _fill_with_fallback(
-                    page,
-                    "tpl_input_pass.png",
-                    pass_input_selectors,
-                    REGISTER_PASSWORD,
-                    phone,
-                    timeout_ms=3000,
-                    field_kind="password",
-                    prefer_dom=True,
-                )
-                if not pass_input_ok:
-                    log(phone, "Password input was not found by template or DOM fallback. Rotating attempt.", "ERROR")
-                    continue
-
-                log(phone, "Filling password confirmation input...", "INFO")
-                pass_confirm_input_selectors = [
-                    "input[name*='confirm' i]",
-                    "input[id*='confirm' i]",
-                    "input[placeholder*='confirm' i]",
-                    "input[name*='confirma' i]",
-                    "input[id*='confirma' i]",
-                    "input[placeholder*='confirma' i]",
-                    "input[name*='repeat' i]",
-                    "input[id*='repeat' i]",
-                    "input[placeholder*='repeat' i]",
-                ]
-                pass_confirm_input_ok = await _fill_with_fallback(
-                    page,
-                    "tpl_input_pass_confirm.png",
-                    pass_confirm_input_selectors,
-                    REGISTER_PASSWORD,
-                    phone,
-                    timeout_ms=3000,
-                    field_kind="password_confirm",
-                    prefer_dom=True,
-                )
-                if not pass_confirm_input_ok:
-                    log(phone, "Password confirmation input was not found by template or DOM fallback. Rotating attempt.", "ERROR")
-                    continue
-
-                dom_values_ok = await validate_registration_values_dom(
-                    page,
-                    phone,
-                    expected_phone=phone,
-                    expected_password=REGISTER_PASSWORD,
-                )
-                if not dom_values_ok:
-                    log(phone, "DOM validation failed for phone/password/password_confirmation. Rotating attempt.", "ERROR")
-                    continue
-
-                log(phone, "Clicking final yellow register button...", "INFO")
-                submit_selectors = [
-                    "button[type='submit']",
-                    "form button:has-text('Inscrever')",
-                    "form button:has-text('Cadastrar')",
-                    'button:has-text("Cadastrar")',
-                    'button:has-text("Inscrever")',
-                    'button:has-text("Registrar")',
-                    "text=Confirmar",
-                ]
-                submit_found = await _click_with_fallback(
-                    page,
-                    "tpl_btn_inscrever_amarelo.png",
-                    submit_selectors,
-                    phone,
-                    timeout_ms=3000,
-                    prefer_dom=True,
-                )
-                if not submit_found:
-                    log(phone, "Final yellow register action not found by template or DOM fallback. Rotating attempt.", "ERROR")
-                    continue
-
-                log(phone, "Passo validado: botao Inscrever amarelo clicado.", "SUCCESS")
-
-                # 4. Bypass do Firewall (1010 Tardio pós-submit)
-                log(phone, "Checking Late 1010 after submit...", "INFO")
-                if run_1010_checks:
-                    if await match_template(page, "tpl_btn_ok_1010.png", timeout_ms=3000, phone=phone):
-                        attempt_video_status = "rotate_1010_late"
-                        _rotate_to_next_proxy("Late 1010 detected after submit.")
-                        continue
-
-                # Sucesso: Grava log e encerra contexto
-                attempt_video_status = "success"
-                log(phone, "SUCCESS! Account registered.", "SUCCESS")
-                with open(SUCCESS_FILE, "a", encoding="utf-8") as f:
-                    f.write(f"{phone}\n")
-                log(phone, f"Phone persisted into {SUCCESS_FILE}", "INFO")
-                return True # Sai do worker
+                continue
 
             except Exception as e:
                 attempt_video_status = "exception"
