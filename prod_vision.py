@@ -1602,6 +1602,37 @@ async def run_registration_form_steps(page, phone, require_submit=False):
     return True
 
 
+async def ensure_registration_tab_ready(page, phone):
+    log(phone, "Keep-alive: garantindo aba/formulario de Inscrever antes do novo cadastro.", "INFO")
+
+    clicked_register = await match_template(
+        page,
+        "tpl_btn_inscrever.png",
+        timeout_ms=REGISTER_ENTRY_SEARCH_TIMEOUT_MS,
+        phone=phone,
+    )
+    if not clicked_register:
+        await _save_debug_screenshot(page, phone, "keep_alive_register_tab_not_found")
+        log(phone, "Keep-alive failed: aba/botao Inscrever nao foi encontrado.", "ERROR")
+        return False
+
+    log(phone, "Keep-alive: aba/botao Inscrever clicado; aguardando formulario de cadastro.", "SUCCESS")
+    await page.wait_for_timeout(REGISTER_FORM_POPUP_WAIT_MS)
+
+    form_ready = await wait_for_registration_form_visual_ready(
+        page,
+        phone,
+        timeout_ms=REGISTER_FORM_READY_TIMEOUT_MS,
+    )
+    if not form_ready:
+        await _save_debug_screenshot(page, phone, "keep_alive_registration_form_not_ready")
+        log(phone, "Keep-alive failed: formulario de Inscrever nao ficou visualmente pronto.", "ERROR")
+        return False
+
+    log(phone, "Keep-alive: formulario de Inscrever pronto para novo cadastro.", "SUCCESS")
+    return True
+
+
 async def detect_success_deposit_button(page, phone, timeout_ms=5000):
     template_name = "tpl_btn_deposito.png"
     template_variants = _get_template_variants(template_name, phone=phone)
@@ -1634,7 +1665,7 @@ async def detect_success_deposit_button(page, phone, timeout_ms=5000):
     return False
 
 
-async def wait_and_capture_post_registration(page, phone):
+async def wait_and_capture_post_registration(page, phone, run_1010_checks=False):
     async def click_first_available_template(step_label, template_names, timeout_ms):
         for template_name in template_names:
             template_path = os.path.join(TEMPLATES_DIR, template_name)
@@ -1661,9 +1692,16 @@ async def wait_and_capture_post_registration(page, phone):
     await page.screenshot(path=screenshot_path, full_page=True)
     log(phone, f"Screenshot pos-cadastro salvo em {screenshot_path}", "SUCCESS")
 
+    if run_1010_checks and await match_template(page, "tpl_btn_ok_1010.png", timeout_ms=3000, phone=phone):
+        log(phone, "Late 1010 detected after submit.", "WARN")
+        return "blocked_1010"
+
     if not await click_first_available_template("Passo pos-cadastro 1: fechar bonus", ("tpl_btn_fechar_bonus.png",), 9000):
         await _save_debug_screenshot(page, phone, "post_registration_close_bonus_not_found")
         return False
+    with open(SUCCESS_FILE, "a", encoding="utf-8") as f:
+        f.write(f"{phone}\n")
+    log(phone, f"Conta criada com sucesso, numero salvo: {phone}", "INFO")
     await page.wait_for_timeout(2000)
 
     if not await click_first_available_template("Passo pos-cadastro 2: abrir menu", ("tpl_btn_engrenagem.png",), 9000):
@@ -1688,7 +1726,7 @@ async def wait_and_capture_post_registration(page, phone):
         return False
 
     log(phone, "Fluxo pos-cadastro concluido: formulario inicial reaberto.", "SUCCESS")
-    return True
+    return "success"
 
 
 async def run_post_success_logout_cycle(page, phone):
@@ -1759,7 +1797,7 @@ async def wait_for_page_readiness(page, phone):
 # ==========================================
 # O WORKER INTELIGENTE
 # ==========================================
-async def worker(phone, semaphore, browser, proxy_list, template_status):
+async def worker(phone, semaphore, playwright_obj, proxy_list, template_status):
     async with semaphore:
         total_attempts = MAX_PROXY_RETRIES_PER_PHONE + 1
         if FLOW_MODE in (
@@ -1850,6 +1888,12 @@ async def worker(phone, semaphore, browser, proxy_list, template_status):
             if not _reload_proxy_list_if_needed("Attempt startup."):
                 break
 
+            if current_proxy_slot < 0 and active_proxy_list:
+                try:
+                    current_proxy_slot = random.randrange(len(active_proxy_list))
+                except Exception:
+                    current_proxy_slot = 0
+
             current_proxy = None
             if current_proxy_slot >= 0 and active_proxy_list:
                 current_proxy = active_proxy_list[current_proxy_slot]["config"]
@@ -1864,9 +1908,13 @@ async def worker(phone, semaphore, browser, proxy_list, template_status):
                 log(phone, f"Attempt {attempt + 1}/{total_attempts}: using Clean IP (no proxy).", "INFO")
 
             context = None
+            browser = None
             page = None
             attempt_video_status = "retry"
             try:
+                log(phone, "Launching browser for current proxy session...", "INFO")
+                browser = await launch_browser_multi_os(playwright_obj)
+
                 log(phone, "Creating browser context...", "INFO")
                 context_options = {
                     "proxy": current_proxy,
@@ -1886,7 +1934,40 @@ async def worker(phone, semaphore, browser, proxy_list, template_status):
                 await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
                 await wait_for_page_readiness(page, phone)
 
+                form_ready_for_registration = False
                 while True:
+                    phone = generate_random_phone()
+                    log(phone, f"Starting keep-alive registration cycle on route {_current_route_label()}.", "INFO")
+
+                    if form_ready_for_registration and FLOW_MODE == "gear_logout_confirm_register_form_only":
+                        if not await ensure_registration_tab_ready(page, phone):
+                            attempt_video_status = "retry_registration_tab_not_ready"
+                            log(phone, "Keep-alive registration tab transition failed. Breaking current proxy session.", "ERROR")
+                            break
+
+                        if await run_registration_form_steps(page, phone, require_submit=True):
+                            post_registration_status = await wait_and_capture_post_registration(
+                                page,
+                                phone,
+                                run_1010_checks=run_1010_checks,
+                            )
+                            if post_registration_status == "success":
+                                form_ready_for_registration = True
+                                continue
+
+                            if post_registration_status == "blocked_1010":
+                                attempt_video_status = "rotate_1010_late"
+                                _rotate_to_next_proxy("Late 1010 detected after submit.")
+                                break
+
+                            attempt_video_status = "retry_post_registration_visual_flow_failed"
+                            log(phone, "Post-registration visual flow failed. Breaking current proxy session.", "ERROR")
+                            break
+
+                        attempt_video_status = "retry_form_sequence_failed"
+                        log(phone, "Keep-alive form sequence failed. Breaking current proxy session.", "ERROR")
+                        break
+
                     initial_gate = await run_initial_gate_step(page, phone, timeout_ms=INITIAL_GATE_TIMEOUT_MS)
                     if not initial_gate:
                         attempt_video_status = "retry_gate_not_matched"
@@ -1937,9 +2018,19 @@ async def worker(phone, semaphore, browser, proxy_list, template_status):
                         ):
                             if require_inputs:
                                 if await run_registration_form_steps(page, phone, require_submit=require_submit):
-                                    if await wait_and_capture_post_registration(page, phone):
-                                        phone = generate_random_phone()
+                                    post_registration_status = await wait_and_capture_post_registration(
+                                        page,
+                                        phone,
+                                        run_1010_checks=run_1010_checks,
+                                    )
+                                    if post_registration_status == "success":
+                                        form_ready_for_registration = True
                                         continue
+
+                                    if post_registration_status == "blocked_1010":
+                                        attempt_video_status = "rotate_1010_late"
+                                        _rotate_to_next_proxy("Late 1010 detected after submit.")
+                                        break
 
                                     attempt_video_status = "retry_post_registration_visual_flow_failed"
                                     log(phone, "FLOW_MODE=gear_logout_confirm_register_form_only: post-registration visual flow failed.", "ERROR")
@@ -2115,9 +2206,18 @@ async def worker(phone, semaphore, browser, proxy_list, template_status):
 
                     log(phone, "Passo validado: botao Inscrever amarelo clicado.", "SUCCESS")
 
-                    if await wait_and_capture_post_registration(page, phone):
-                        phone = generate_random_phone()
+                    post_registration_status = await wait_and_capture_post_registration(
+                        page,
+                        phone,
+                        run_1010_checks=run_1010_checks,
+                    )
+                    if post_registration_status == "success":
                         continue
+
+                    if post_registration_status == "blocked_1010":
+                        attempt_video_status = "rotate_1010_late"
+                        _rotate_to_next_proxy("Late 1010 detected after submit.")
+                        break
 
                     attempt_video_status = "retry_post_registration_visual_flow_failed"
                     log(phone, "Post-registration visual flow failed. Breaking current session.", "ERROR")
@@ -2142,6 +2242,12 @@ async def worker(phone, semaphore, browser, proxy_list, template_status):
                         await context.close()
                     except Exception as e:
                         log(phone, f"Context close warning on attempt {attempt + 1}: {e}", "WARN")
+                if browser is not None:
+                    log(phone, f"Closing browser for attempt {attempt + 1}.", "INFO")
+                    try:
+                        await browser.close()
+                    except Exception as e:
+                        log(phone, f"Browser close warning on attempt {attempt + 1}: {e}", "WARN")
 
                 
 
@@ -2175,12 +2281,9 @@ async def main():
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_BROWSERS)
 
     async with async_playwright() as p:
-        browser = None
         try:
-            browser = await launch_browser_multi_os(p)
-
             log("SYSTEM", "Starting worker task batch.", "INFO")
-            tasks = [worker(phone, semaphore, browser, proxy_list, template_status) for phone in phones_to_register]
+            tasks = [worker(phone, semaphore, p, proxy_list, template_status) for phone in phones_to_register]
             results = await asyncio.gather(*tasks)
             success_count = sum(1 for result in results if result)
             log("SYSTEM", f"Worker batch completed. Success count: {success_count}/{len(phones_to_register)}", "SUCCESS")
@@ -2192,13 +2295,6 @@ async def main():
                 "WARN",
             )
             raise
-        finally:
-            if browser is not None:
-                log("SYSTEM", "Closing browser.", "INFO")
-                try:
-                    await browser.close()
-                except Exception as e:
-                    log("SYSTEM", f"Browser close warning: {e}", "WARN")
     log("SYSTEM", "Batch execution finished.", "SUCCESS")
 
 if __name__ == "__main__":
