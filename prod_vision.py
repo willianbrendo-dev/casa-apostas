@@ -51,6 +51,9 @@ TEMPLATE_THRESHOLDS = {
     "tpl_btn_sair.png": 0.62,
     "tpl_btn_confirmar.png": 0.56,
     "tpl_btn_inscrever.png": 0.85,
+    "tpl_btn_fechar_bonus.png": 0.56,
+    "tpl_btn_sair_config.png": 0.62,
+    "tpl_btn_confirmar_sair.png": 0.56,
     "tpl_input_phone.png": 0.62,
     "tpl_input_pass.png": 0.62,
     "tpl_input_pass_confirm.png": 0.62,
@@ -1632,6 +1635,20 @@ async def detect_success_deposit_button(page, phone, timeout_ms=5000):
 
 
 async def wait_and_capture_post_registration(page, phone):
+    async def click_first_available_template(step_label, template_names, timeout_ms):
+        for template_name in template_names:
+            template_path = os.path.join(TEMPLATES_DIR, template_name)
+            if not os.path.exists(template_path):
+                log(phone, f"{step_label}: template ausente, tentando fallback: {template_name}", "WARN")
+                continue
+
+            if await match_template(page, template_name, timeout_ms=timeout_ms, phone=phone):
+                log(phone, f"{step_label}: clicado via {template_name}.", "SUCCESS")
+                return True
+
+        log(phone, f"{step_label}: nenhum template foi encontrado/clicado: {template_names}", "ERROR")
+        return False
+
     log(phone, "Aguardando carregamento completo apos cadastro...", "INFO")
     await page.wait_for_load_state("networkidle")
     log(phone, "Carregamento pos-cadastro: networkidle recebido.", "SUCCESS")
@@ -1643,7 +1660,35 @@ async def wait_and_capture_post_registration(page, phone):
     screenshot_path = os.path.join("debug", "tela_pos_cadastro.png")
     await page.screenshot(path=screenshot_path, full_page=True)
     log(phone, f"Screenshot pos-cadastro salvo em {screenshot_path}", "SUCCESS")
-    sys.exit(0)
+
+    if not await click_first_available_template("Passo pos-cadastro 1: fechar bonus", ("tpl_btn_fechar_bonus.png",), 9000):
+        await _save_debug_screenshot(page, phone, "post_registration_close_bonus_not_found")
+        return False
+    await page.wait_for_timeout(2000)
+
+    if not await click_first_available_template("Passo pos-cadastro 2: abrir menu", ("tpl_btn_engrenagem.png",), 9000):
+        await _save_debug_screenshot(page, phone, "post_registration_gear_not_found")
+        return False
+    await page.wait_for_timeout(1000)
+
+    if not await click_first_available_template("Passo pos-cadastro 3: sair", ("tpl_btn_sair_config.png", "tpl_btn_sair.png"), 9000):
+        await _save_debug_screenshot(page, phone, "post_registration_logout_not_found")
+        return False
+    await page.wait_for_timeout(1000)
+
+    if not await click_first_available_template("Passo pos-cadastro 4: confirmar logout", ("tpl_btn_confirmar_sair.png", "tpl_btn_confirmar.png"), 9000):
+        await _save_debug_screenshot(page, phone, "post_registration_confirm_logout_not_found")
+        return False
+
+    await page.wait_for_load_state("networkidle")
+    log(phone, "Tela inicial recarregada apos logout.", "SUCCESS")
+
+    if not await click_first_available_template("Passo pos-cadastro 5: abrir formulario inicial", ("tpl_btn_inscrever.png",), REGISTER_ENTRY_SEARCH_TIMEOUT_MS):
+        await _save_debug_screenshot(page, phone, "post_registration_register_entry_not_found")
+        return False
+
+    log(phone, "Fluxo pos-cadastro concluido: formulario inicial reaberto.", "SUCCESS")
+    return True
 
 
 async def run_post_success_logout_cycle(page, phone):
@@ -1892,7 +1937,13 @@ async def worker(phone, semaphore, browser, proxy_list, template_status):
                         ):
                             if require_inputs:
                                 if await run_registration_form_steps(page, phone, require_submit=require_submit):
-                                    await wait_and_capture_post_registration(page, phone)
+                                    if await wait_and_capture_post_registration(page, phone):
+                                        phone = generate_random_phone()
+                                        continue
+
+                                    attempt_video_status = "retry_post_registration_visual_flow_failed"
+                                    log(phone, "FLOW_MODE=gear_logout_confirm_register_form_only: post-registration visual flow failed.", "ERROR")
+                                    break
 
                                 attempt_video_status = "retry_form_sequence_failed"
                                 log(phone, f"FLOW_MODE={FLOW_MODE}: form sequence failed. Breaking current session.", "ERROR")
@@ -2064,7 +2115,13 @@ async def worker(phone, semaphore, browser, proxy_list, template_status):
 
                     log(phone, "Passo validado: botao Inscrever amarelo clicado.", "SUCCESS")
 
-                    await wait_and_capture_post_registration(page, phone)
+                    if await wait_and_capture_post_registration(page, phone):
+                        phone = generate_random_phone()
+                        continue
+
+                    attempt_video_status = "retry_post_registration_visual_flow_failed"
+                    log(phone, "Post-registration visual flow failed. Breaking current session.", "ERROR")
+                    break
 
                     
                 if attempt_video_status == "success":
